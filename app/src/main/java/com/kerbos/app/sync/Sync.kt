@@ -1,8 +1,13 @@
 package com.kerbos.app.sync
 
+import android.content.Context
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.Uri
+import com.kerbos.app.Prefs
 import com.kerbos.app.vault.Crypto
 import com.kerbos.app.vault.Entry
+import com.kerbos.app.vault.Merge
 import com.kerbos.app.vault.VaultRepository
 import com.kerbos.app.vault.VaultState
 import kotlinx.coroutines.CoroutineScope
@@ -19,12 +24,14 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import okhttp3.Credentials
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import javax.crypto.AEADBadTagException
 
@@ -52,71 +59,162 @@ data class SyncConfig(
 
 class SyncException(msg: String) : Exception(msg)
 
-/** Minimal WebDAV client (GET / PUT with ETag preconditions / MKCOL) for Nextcloud. */
+/**
+ * Minimal WebDAV client for Nextcloud.
+ *
+ * Nextcloud's WebDAV root is /remote.php/dav/files/<USER ID>/ — the internal user id, which often
+ * differs from the login (e-mail login, LDAP, SSO…). The id is therefore asked to the server through
+ * the OCS API instead of trusting what the user typed. The server address is also cleaned up when it
+ * was copied from the browser (…/index.php/apps/files, …/remote.php/…).
+ */
 class WebDav(private val cfg: SyncConfig) {
-    private val auth = Credentials.basic(cfg.user.trim(), cfg.appPassword.trim())
+    private val auth = Credentials.basic(cfg.user.trim(), cfg.appPassword.trim(), Charsets.UTF_8)
 
-    val folderUrl: String = run {
-        var base = cfg.server.trim().trimEnd('/')
-        if (!base.startsWith("http://") && !base.startsWith("https://")) base = "https://$base"
-        val dav = if (base.contains("/remote.php/")) base else "$base/remote.php/dav/files/${Uri.encode(cfg.user.trim())}"
-        val segs = cfg.folder.split('/').filter { it.isNotBlank() }.joinToString("/") { Uri.encode(it.trim()) }
-        if (segs.isEmpty()) dav else "$dav/$segs"
+    /** Server root, e.g. https://cloud.example.org or https://example.org/nextcloud */
+    val baseUrl: String
+    /** User id taken from a pasted WebDAV URL, if any. */
+    private val idFromUrl: String?
+
+    init {
+        var s = cfg.server.trim().trimEnd('/')
+        if (!s.startsWith("http://") && !s.startsWith("https://")) s = "https://$s"
+        var id: String? = null
+        val davMarker = "/remote.php/dav/files/"
+        if (s.contains(davMarker)) {
+            id = s.substringAfter(davMarker).substringBefore('/').takeIf { it.isNotBlank() }?.let { Uri.decode(it) }
+        }
+        for (marker in listOf("/remote.php", "/index.php", "/apps/", "/ocs/", "/login", "/s/", "/f/")) {
+            val i = s.indexOf(marker)
+            if (i > 0 && i > s.indexOf("://") + 3) s = s.substring(0, i)
+        }
+        baseUrl = s.trimEnd('/')
+        idFromUrl = id
     }
-    private val fileUrl = "$folderUrl/$FILE_NAME"
 
-    class Remote(val body: String, val etag: String?)
+    private val folderSegments: List<String> =
+        cfg.folder.replace('\\', '/').split('/').map { it.trim() }.filter { it.isNotEmpty() }
 
     private fun req(url: String) = Request.Builder().url(url).header("Authorization", auth)
 
-    private fun httpError(code: Int): SyncException = SyncException(
+    private fun httpError(code: Int, url: String): SyncException = SyncException(
         when (code) {
-            401 -> "Identifiants Nextcloud refusés (401). Vérifiez l'utilisateur et le mot de passe d'application."
-            403 -> "Accès refusé (403)."
-            404 -> "Dossier introuvable (404)."
+            401 -> "Identifiants refusés (401). Vérifiez le nom d'utilisateur et le mot de passe d'application."
+            403 -> "Accès refusé (403) sur $url"
+            404 -> "Introuvable (404) : $url"
+            405 -> "Méthode refusée (405) sur $url"
+            409 -> "Dossier parent manquant (409) : $url"
             in 500..599 -> "Erreur du serveur ($code)."
-            else -> "Erreur HTTP $code"
+            else -> "Erreur HTTP $code sur $url"
         }
     )
 
+    /** Asks Nextcloud for the real user id. Throws on bad credentials. */
+    fun userId(): String {
+        idFromUrl?.let { return it }
+        val key = "$baseUrl|${cfg.user.trim()}"
+        idCache[key]?.let { return it }
+        val url = "$baseUrl/ocs/v2.php/cloud/user?format=json"
+        val id = client.newCall(req(url).header("OCS-APIRequest", "true").header("Accept", "application/json").build())
+            .execute().use { r ->
+                when (r.code) {
+                    200 -> runCatching {
+                        JSONObject(r.body?.string() ?: "").getJSONObject("ocs").getJSONObject("data").getString("id")
+                    }.getOrNull()
+                    401 -> throw httpError(401, url)
+                    else -> null
+                }
+            } ?: cfg.user.trim()
+        idCache[key] = id
+        return id
+    }
+
+    private fun userRoot() = "$baseUrl/remote.php/dav/files/${Uri.encode(userId())}"
+    fun folderUrl(): String = userRoot() + folderSegments.joinToString("") { "/" + Uri.encode(it) }
+    private fun fileUrl() = folderUrl() + "/" + FILE_NAME
+
+    class Remote(val body: String, val etag: String?)
+
     fun get(): Remote? {
-        client.newCall(req(fileUrl).get().build()).execute().use { r ->
+        val url = fileUrl()
+        client.newCall(req(url).get().build()).execute().use { r ->
             return when (r.code) {
                 200 -> Remote(r.body?.string() ?: "", r.header("ETag"))
                 404 -> null
-                else -> throw httpError(r.code)
+                else -> throw httpError(r.code, url)
             }
         }
     }
 
+    private fun propfindExists(url: String): Boolean {
+        val body = """<?xml version="1.0"?><d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/></d:prop></d:propfind>"""
+        client.newCall(
+            req(url).header("Depth", "0").method("PROPFIND", body.toRequestBody("application/xml".toMediaType())).build()
+        ).execute().use { r ->
+            return when (r.code) {
+                207, 200 -> true
+                404 -> false
+                else -> throw httpError(r.code, url)
+            }
+        }
+    }
+
+    fun folderExists() = propfindExists(folderUrl())
+
+    /** Creates every missing folder level (MKCOL), like `mkdir -p`. */
     fun ensureFolder() {
-        val base = folderUrl.substringBefore("/remote.php/dav/files/") + "/remote.php/dav/files/"
-        if (!folderUrl.startsWith(base)) return
-        val parts = folderUrl.removePrefix(base).split('/')
-        var url = base + parts.first()
-        for (p in parts.drop(1)) {
-            url += "/$p"
+        val root = userRoot()
+        if (!propfindExists(root)) throw SyncException(
+            "Espace utilisateur introuvable : $root. Vérifiez l'adresse du serveur et le nom d'utilisateur."
+        )
+        var url = root
+        for (seg in folderSegments) {
+            url += "/" + Uri.encode(seg)
             client.newCall(req(url).method("MKCOL", null).build()).execute().use { r ->
-                if (r.code != 201 && r.code != 405 && r.code != 409) throw httpError(r.code)
+                if (r.code != 201 && r.code != 405) throw httpError(r.code, url)
             }
         }
     }
 
     /** Returns false when the remote file changed since [etag] (HTTP 412). */
     fun put(body: String, etag: String?): Boolean {
-        val b = req(fileUrl).put(body.toRequestBody("application/json".toMediaType()))
+        val url = fileUrl()
+        val b = req(url).put(body.toRequestBody("application/json".toMediaType()))
         if (etag != null) b.header("If-Match", etag) else b.header("If-None-Match", "*")
         client.newCall(b.build()).execute().use { r ->
             return when (r.code) {
                 200, 201, 204 -> true
                 412 -> false
-                else -> throw httpError(r.code)
+                else -> throw httpError(r.code, url)
             }
         }
     }
 
+    /** Human-readable connection diagnostic for the settings screen. */
+    fun diagnose(): String {
+        val sb = StringBuilder()
+        val id = userId()
+        sb.append("✓ Connexion à $baseUrl réussie\n")
+        sb.append("✓ Compte : $id")
+        if (!id.equals(cfg.user.trim(), ignoreCase = false)) sb.append(" (identifiant interne, différent du login « ${cfg.user.trim()} »)")
+        sb.append('\n')
+        if (!propfindExists(userRoot())) {
+            sb.append("✗ Espace WebDAV introuvable : ${userRoot()}")
+            return sb.toString()
+        }
+        val folderName = folderSegments.joinToString("/").ifEmpty { "(racine)" }
+        if (folderExists()) {
+            sb.append("✓ Dossier « $folderName » trouvé\n")
+            sb.append(if (get() != null) "✓ Coffre synchronisé présent ($FILE_NAME)" else "• Aucun coffre pour l'instant : il sera créé à la première synchro")
+        } else {
+            sb.append("• Dossier « $folderName » absent : il sera créé automatiquement à la première synchro\n")
+            sb.append("  (${folderUrl()})")
+        }
+        return sb.toString()
+    }
+
     companion object {
         const val FILE_NAME = "kerbos-vault.json"
+        private val idCache = ConcurrentHashMap<String, String>()
         val client: OkHttpClient = OkHttpClient.Builder()
             .connectTimeout(20, TimeUnit.SECONDS).readTimeout(30, TimeUnit.SECONDS)
             .writeTimeout(30, TimeUnit.SECONDS).build()
@@ -127,6 +225,7 @@ sealed interface SyncStatus {
     data object Disabled : SyncStatus
     data object Idle : SyncStatus
     data object Running : SyncStatus
+    data object WaitingWifi : SyncStatus
     data class Ok(val at: Long, val count: Int) : SyncStatus
     data class Error(val message: String, val at: Long) : SyncStatus
 }
@@ -137,7 +236,7 @@ sealed interface SyncStatus {
  * merges per entry (last writer wins), and uploads with an If-Match precondition so concurrent
  * writers never overwrite each other: on conflict the cycle simply restarts.
  */
-class SyncManager(private val vault: VaultRepository) {
+class SyncManager(private val ctx: Context, private val vault: VaultRepository, private val prefs: Prefs) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val mutex = Mutex()
     private var loop: Job? = null
@@ -148,9 +247,7 @@ class SyncManager(private val vault: VaultRepository) {
 
     init {
         scope.launch {
-            vault.state.collect { s ->
-                if (s == VaultState.UNLOCKED) start() else stop()
-            }
+            vault.state.collect { s -> if (s == VaultState.UNLOCKED) start() else stop() }
         }
     }
 
@@ -161,7 +258,7 @@ class SyncManager(private val vault: VaultRepository) {
             launch { vault.changes.debounce(1200).collect { syncNow() } }
             while (isActive) {
                 syncNow()
-                delay(PERIOD_MS)
+                delay(prefs.syncInterval.value.coerceAtLeast(15) * 1000L)
             }
         }
     }
@@ -180,6 +277,12 @@ class SyncManager(private val vault: VaultRepository) {
         requestSync()
     }
 
+    private fun onUnmeteredNetwork(): Boolean {
+        val cm = ctx.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val caps = cm.getNetworkCapabilities(cm.activeNetwork) ?: return false
+        return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
+    }
+
     private fun key(passphrase: String, salt: ByteArray, iter: Int): ByteArray {
         val s = Crypto.b64(salt)
         keyCache?.let { (p, cs, k) -> if (p == passphrase && cs == s) return k }
@@ -188,26 +291,33 @@ class SyncManager(private val vault: VaultRepository) {
         return k
     }
 
-    suspend fun syncNow(): SyncStatus = mutex.withLock {
+    suspend fun syncNow(force: Boolean = false): SyncStatus = mutex.withLock {
         val cfg = vault.syncConfig.value
         if (vault.state.value != VaultState.UNLOCKED) return@withLock _status.value
         if (!cfg.enabled || !cfg.complete) {
             _status.value = SyncStatus.Disabled
             return@withLock SyncStatus.Disabled
         }
+        if (!force && prefs.syncWifiOnly.value && !onUnmeteredNetwork()) {
+            _status.value = SyncStatus.WaitingWifi
+            return@withLock SyncStatus.WaitingWifi
+        }
         _status.value = SyncStatus.Running
+        val now = System.currentTimeMillis()
         val result = try {
             runCycle(cfg)
         } catch (e: SyncException) {
-            SyncStatus.Error(e.message ?: "Erreur", System.currentTimeMillis())
+            SyncStatus.Error(e.message ?: "Erreur", now)
         } catch (e: java.net.UnknownHostException) {
-            SyncStatus.Error("Serveur injoignable (hors ligne ?)", System.currentTimeMillis())
+            SyncStatus.Error("Serveur injoignable (hors ligne ou adresse erronée)", now)
         } catch (e: javax.net.ssl.SSLException) {
-            SyncStatus.Error("Erreur TLS : ${e.message}", System.currentTimeMillis())
+            SyncStatus.Error("Erreur TLS : ${e.message}", now)
         } catch (e: java.io.IOException) {
-            SyncStatus.Error("Réseau : ${e.message ?: e.javaClass.simpleName}", System.currentTimeMillis())
+            SyncStatus.Error("Réseau : ${e.message ?: e.javaClass.simpleName}", now)
+        } catch (e: IllegalArgumentException) {
+            SyncStatus.Error("Adresse du serveur invalide", now)
         } catch (e: Exception) {
-            SyncStatus.Error(e.message ?: e.javaClass.simpleName, System.currentTimeMillis())
+            SyncStatus.Error(e.message ?: e.javaClass.simpleName, now)
         }
         _status.value = result
         result
@@ -222,7 +332,7 @@ class SyncManager(private val vault: VaultRepository) {
             val remoteEntries: List<Entry>
             if (remote == null) {
                 salt = Crypto.random(16); iter = Crypto.PBKDF2_ITER; remoteEntries = emptyList()
-                dav.ensureFolder()
+                if (!dav.folderExists()) dav.ensureFolder()
             } else {
                 val o = try { JSONObject(remote.body) } catch (e: Exception) { throw SyncException("Fichier distant illisible") }
                 if (o.optString("format") != FORMAT) throw SyncException("Fichier distant inconnu")
@@ -239,7 +349,7 @@ class SyncManager(private val vault: VaultRepository) {
 
             val merged = vault.mergeRemote(remoteEntries)
 
-            if (remote == null || !com.kerbos.app.vault.Merge.same(merged, remoteEntries)) {
+            if (remote == null || !Merge.same(merged, remoteEntries)) {
                 val k = key(cfg.passphrase, salt, iter)
                 val payload = JSONObject().put("entries", Entry.listToJson(merged))
                     .put("updatedBy", vault.deviceId).put("updatedAt", System.currentTimeMillis())
@@ -254,20 +364,20 @@ class SyncManager(private val vault: VaultRepository) {
         throw SyncException("Conflit d'écriture persistant, nouvel essai plus tard.")
     }
 
-    suspend fun test(cfg: SyncConfig): String = kotlinx.coroutines.withContext(Dispatchers.IO) {
+    suspend fun test(cfg: SyncConfig): String = withContext(Dispatchers.IO) {
         try {
-            val dav = WebDav(cfg)
-            val r = dav.get()
-            if (r == null) "Connexion OK — aucun coffre distant pour l'instant, il sera créé dans ${dav.folderUrl}"
-            else "Connexion OK — coffre distant trouvé."
+            WebDav(cfg).diagnose()
+        } catch (e: java.net.UnknownHostException) {
+            "✗ Serveur introuvable : vérifiez l'adresse (${e.message})"
+        } catch (e: IllegalArgumentException) {
+            "✗ Adresse du serveur invalide"
         } catch (e: Exception) {
-            "Échec : ${e.message ?: e.javaClass.simpleName}"
+            "✗ ${e.message ?: e.javaClass.simpleName}"
         }
     }
 
     companion object {
         private const val FORMAT = "kerbos-sync"
         private const val AAD = "kerbos-sync-v1"
-        private const val PERIOD_MS = 60_000L
     }
 }

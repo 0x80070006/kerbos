@@ -1,6 +1,10 @@
 package com.kerbos.app.ui
 
 import android.app.Activity
+import android.os.Build
+import androidx.compose.material3.dynamicDarkColorScheme
+import androidx.compose.material3.dynamicLightColorScheme
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
@@ -77,9 +81,20 @@ private val KerbosShapes = Shapes(
 )
 
 @Composable
-fun KerbosTheme(themePref: Int, content: @Composable () -> Unit) {
+fun KerbosTheme(themePref: Int, amoled: Boolean = false, dynamic: Boolean = false, content: @Composable () -> Unit) {
     val dark = when (themePref) { 1 -> false; 2 -> true; else -> isSystemInDarkTheme() }
     val view = LocalView.current
+    val ctx = LocalContext.current
+    var scheme = when {
+        dynamic && Build.VERSION.SDK_INT >= 31 -> if (dark) dynamicDarkColorScheme(ctx) else dynamicLightColorScheme(ctx)
+        dark -> DarkColors
+        else -> LightColors
+    }
+    if (dark && amoled) scheme = scheme.copy(
+        background = Color.Black, surface = Color.Black, surfaceContainerLowest = Color.Black,
+        surfaceContainerLow = Color(0xFF0D0B14), surfaceContainer = Color(0xFF12101C),
+        surfaceContainerHigh = Color(0xFF1A1727), surfaceContainerHighest = Color(0xFF221E33),
+    )
     if (!view.isInEditMode) {
         SideEffect {
             val window = (view.context as Activity).window
@@ -90,7 +105,7 @@ fun KerbosTheme(themePref: Int, content: @Composable () -> Unit) {
         }
     }
     MaterialTheme(
-        colorScheme = if (dark) DarkColors else LightColors,
+        colorScheme = scheme,
         typography = KerbosTypography,
         shapes = KerbosShapes,
         content = content,

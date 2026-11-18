@@ -42,6 +42,7 @@ import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material.icons.rounded.Star
 import androidx.compose.material.icons.rounded.SyncProblem
+import androidx.compose.material.icons.rounded.WifiOff
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -109,9 +110,14 @@ fun HomeScreen(activity: MainActivity, nav: Nav) {
         while (true) { value = System.currentTimeMillis(); delay(250) }
     }
 
-    val entries = remember(all) {
+    val sort = app.prefs.sortMode.value
+    val entries = remember(all, sort) {
         all.filter { !it.deleted }.sortedWith(
-            compareByDescending<Entry> { it.favorite }.thenBy { it.title.lowercase() }.thenBy { it.name.lowercase() }
+            when (sort) {
+                1 -> compareByDescending<Entry> { it.favorite }.thenBy { it.name.lowercase() }.thenBy { it.title.lowercase() }
+                2 -> compareByDescending<Entry> { it.favorite }.thenByDescending { it.createdAt }
+                else -> compareByDescending<Entry> { it.favorite }.thenBy { it.title.lowercase() }.thenBy { it.name.lowercase() }
+            }
         )
     }
     val groups = remember(entries) { entries.map { it.group }.filter { it.isNotBlank() }.distinct().sorted() }
@@ -164,7 +170,7 @@ fun HomeScreen(activity: MainActivity, nav: Nav) {
     ) { pad ->
         LazyColumn(
             contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = pad.calculateTopPadding(), bottom = 110.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp),
+            verticalArrangement = Arrangement.spacedBy(if (app.prefs.compact.value) 6.dp else 10.dp),
             modifier = Modifier.fillMaxSize(),
         ) {
             item {
@@ -205,6 +211,7 @@ fun HomeScreen(activity: MainActivity, nav: Nav) {
                 }
                 AddOption(Icons.Rounded.Image, MaterialTheme.colorScheme.secondary, "Importer une image", "Capture d'écran contenant un QR code") {
                     showAdd = false
+                    app.expectExternalActivity()
                     pickImage.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
                 }
                 AddOption(Icons.Rounded.Edit, MaterialTheme.colorScheme.tertiary, "Saisie manuelle", "Entrer la clé secrète") {
@@ -250,6 +257,7 @@ private fun SyncBadge(s: SyncStatus, onClick: () -> Unit) {
             is SyncStatus.Error -> Icon(Icons.Rounded.SyncProblem, "Erreur de synchronisation", tint = MaterialTheme.colorScheme.error)
             SyncStatus.Disabled -> Icon(Icons.Rounded.CloudOff, "Synchronisation désactivée", tint = MaterialTheme.colorScheme.outline)
             SyncStatus.Idle -> Icon(Icons.Rounded.CloudSync, "Synchroniser")
+            SyncStatus.WaitingWifi -> Icon(Icons.Rounded.WifiOff, "En attente du Wi-Fi", tint = MaterialTheme.colorScheme.outline)
         }
     }
 }
@@ -272,52 +280,80 @@ private fun EmptyState(onAdd: () -> Unit) {
 private fun EntryCard(e: Entry, now: Long, onEdit: () -> Unit, modifier: Modifier = Modifier) {
     val ctx = LocalContext.current
     val haptic = LocalHapticFeedback.current
-    val tapToReveal = app.prefs.tapToReveal
+    val prefs = app.prefs
+    val compact = prefs.compact.value
     var revealed by remember { mutableStateOf(false) }
-    val period = if (e.type == OtpType.HOTP) 0L else (now / 1000) / e.period.coerceAtLeast(1)
-    val code = remember(e, period) { Otp.generate(e, now) }
+    val step = if (e.type == OtpType.HOTP) 0L else (now / 1000) / e.period.coerceAtLeast(1)
+    val code = remember(e, step) { Otp.generate(e, now) }
+    val next = remember(e, step) {
+        if (e.type == OtpType.HOTP) Otp.generate(e.copy(counter = e.counter + 1)) else Otp.generate(e, now + e.period * 1000L)
+    }
     val (frac, secs) = Otp.remaining(e, now)
     val urgent = e.type != OtpType.HOTP && secs <= 5
     val codeColor by animateColorAsState(
         if (urgent) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.primary, label = "code",
     )
-    val hidden = tapToReveal && !revealed
+    val hidden = prefs.tapToReveal.value && !revealed
+    val fmt: (String) -> String = { if (prefs.groupDigits.value) Otp.format(it) else it }
+    val codeSp = when (prefs.codeSize.value) { 0 -> 24; 2 -> 36; else -> 30 }.let { if (compact) it - 4 else it }
 
     Card(
-        shape = RoundedCornerShape(22.dp),
+        shape = RoundedCornerShape(if (compact) 16.dp else 22.dp),
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLow),
         modifier = modifier.fillMaxWidth().combinedClickable(
             onClick = {
                 if (hidden) revealed = true
                 else {
                     copyToClipboard(ctx, e.title, code)
-                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                    if (prefs.haptics.value) haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                    if (prefs.minimizeOnCopy.value) (ctx as? android.app.Activity)?.moveTaskToBack(true)
                 }
             },
-            onLongClick = { haptic.performHapticFeedback(HapticFeedbackType.LongPress); onEdit() },
+            onLongClick = { if (prefs.haptics.value) haptic.performHapticFeedback(HapticFeedbackType.LongPress); onEdit() },
         ),
     ) {
-        Row(Modifier.padding(horizontal = 16.dp, vertical = 14.dp), verticalAlignment = Alignment.CenterVertically) {
-            EntryAvatar(e, 50.dp)
-            Spacer(Modifier.width(14.dp))
+        Row(
+            Modifier.padding(horizontal = if (compact) 12.dp else 16.dp, vertical = if (compact) 8.dp else 14.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            if (prefs.showIcons.value) {
+                EntryAvatar(e, if (compact) 38.dp else 50.dp)
+                Spacer(Modifier.width(if (compact) 10.dp else 14.dp))
+            }
             Column(Modifier.weight(1f)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(e.title.ifBlank { "Sans nom" }, style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
+                    Text(
+                        e.title.ifBlank { "Sans nom" }, style = MaterialTheme.typography.titleMedium, maxLines = 1,
+                        overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false),
+                    )
                     if (e.favorite) {
                         Spacer(Modifier.width(4.dp))
                         Icon(Icons.Rounded.Star, null, tint = Amber, modifier = Modifier.size(16.dp))
                     }
+                    if (compact && e.subtitle.isNotBlank()) Text(
+                        "  ·  " + e.subtitle, style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                    )
                 }
-                if (e.subtitle.isNotBlank()) Text(
+                if (!compact && e.subtitle.isNotBlank()) Text(
                     e.subtitle, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
                     maxLines = 1, overflow = TextOverflow.Ellipsis,
                 )
-                Spacer(Modifier.height(2.dp))
-                Text(
-                    if (hidden) "••• •••" else Otp.format(code),
-                    fontSize = 30.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace,
-                    letterSpacing = 1.sp, color = codeColor,
-                )
+                if (!compact) Spacer(Modifier.height(2.dp))
+                Row(verticalAlignment = Alignment.Bottom) {
+                    Text(
+                        if (hidden) "•••  •••" else fmt(code),
+                        fontSize = codeSp.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace,
+                        letterSpacing = 1.sp, color = codeColor,
+                    )
+                    if (prefs.showNextCode.value && !hidden) {
+                        Spacer(Modifier.width(10.dp))
+                        Text(
+                            fmt(next), fontFamily = FontFamily.Monospace, fontSize = (codeSp * 0.5f).sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(bottom = 4.dp),
+                        )
+                    }
+                }
             }
             Spacer(Modifier.width(8.dp))
             if (e.type == OtpType.HOTP) {
@@ -325,12 +361,13 @@ private fun EntryCard(e: Entry, now: Long, onEdit: () -> Unit, modifier: Modifie
                     Icon(Icons.Rounded.Refresh, "Code suivant", tint = MaterialTheme.colorScheme.primary)
                 }
             } else {
-                Box(contentAlignment = Alignment.Center, modifier = Modifier.size(44.dp)) {
+                val ring = if (compact) 36.dp else 44.dp
+                Box(contentAlignment = Alignment.Center, modifier = Modifier.size(ring)) {
                     CircularProgressIndicator(
-                        progress = { frac }, modifier = Modifier.size(44.dp), strokeWidth = 4.dp,
+                        progress = { frac }, modifier = Modifier.size(ring), strokeWidth = if (compact) 3.dp else 4.dp,
                         color = codeColor, trackColor = codeColor.copy(alpha = 0.15f),
                     )
-                    Text("$secs", fontWeight = FontWeight.Bold, fontSize = 14.sp, color = codeColor)
+                    Text("$secs", fontWeight = FontWeight.Bold, fontSize = if (compact) 12.sp else 14.sp, color = codeColor)
                 }
             }
         }

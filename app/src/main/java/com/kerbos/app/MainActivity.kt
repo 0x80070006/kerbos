@@ -28,6 +28,8 @@ import com.kerbos.app.ui.KerbosTheme
 import com.kerbos.app.ui.LockScreen
 import com.kerbos.app.ui.ScanScreen
 import com.kerbos.app.ui.SettingsScreen
+import com.kerbos.app.ui.SettingsSection
+import com.kerbos.app.ui.TransferScreen
 import com.kerbos.app.ui.SetupScreen
 import com.kerbos.app.ui.SyncScreen
 import com.kerbos.app.vault.Entry
@@ -37,10 +39,11 @@ class MainActivity : FragmentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        applySecure(app.prefs.blockScreenshots)
+        applySecure(app.prefs.blockScreenshots.value)
         handleIntent(intent)
         setContent {
-            KerbosTheme(app.prefs.theme) { Root(this) }
+            val p = app.prefs
+            KerbosTheme(p.theme.value, p.amoled.value, p.dynamicColor.value) { Root(this) }
         }
     }
 
@@ -64,6 +67,8 @@ sealed interface Route {
     data object Scan : Route
     data object Settings : Route
     data object Sync : Route
+    data object Transfer : Route
+    data class Section(val id: String) : Route
     data class Edit(val entry: Entry, val isNew: Boolean) : Route
 }
 
@@ -108,6 +113,8 @@ private fun MainNav(activity: MainActivity) {
             Route.Scan -> ScanScreen(nav)
             Route.Settings -> SettingsScreen(activity, nav)
             Route.Sync -> SyncScreen(nav)
+            Route.Transfer -> TransferScreen(activity, nav)
+            is Route.Section -> SettingsSection(route.id, activity, nav)
             is Route.Edit -> EditScreen(route.entry, route.isNew, nav)
         }
     }

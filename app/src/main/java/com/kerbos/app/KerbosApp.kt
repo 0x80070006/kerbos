@@ -2,8 +2,10 @@ package com.kerbos.app
 
 import android.app.Application
 import android.content.Context
+import android.content.SharedPreferences
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.DefaultLifecycleObserver
@@ -15,26 +17,52 @@ import com.kerbos.app.vault.VaultRepository
 import com.kerbos.app.vault.VaultState
 import kotlinx.coroutines.flow.MutableStateFlow
 
-/** Non-sensitive preferences (readable before unlock). */
+/** Non-sensitive preferences (readable before unlock), observable from Compose. */
 class Prefs(ctx: Context) {
-    private val sp = ctx.getSharedPreferences("kerbos_prefs", Context.MODE_PRIVATE)
+    private val sp: SharedPreferences = ctx.getSharedPreferences("kerbos_prefs", Context.MODE_PRIVATE)
 
-    var theme by mutableIntStateOf(sp.getInt("theme", 0)) // 0 système, 1 clair, 2 sombre
-        private set
-    var autoLockSeconds by mutableIntStateOf(sp.getInt("autolock", 30)) // -1 = jamais
-        private set
-    var bioAutoPrompt by mutableStateOf(sp.getBoolean("bio_auto", true))
-        private set
-    var blockScreenshots by mutableStateOf(sp.getBoolean("secure", true))
-        private set
-    var tapToReveal by mutableStateOf(sp.getBoolean("reveal", false))
-        private set
+    inner class BoolPref(private val key: String, def: Boolean) {
+        var value by mutableStateOf(sp.getBoolean(key, def)); private set
+        fun set(v: Boolean) { value = v; sp.edit().putBoolean(key, v).apply() }
+    }
 
-    fun updateTheme(v: Int) { theme = v; sp.edit().putInt("theme", v).apply() }
-    fun setAutoLock(v: Int) { autoLockSeconds = v; sp.edit().putInt("autolock", v).apply() }
-    fun setBioAuto(v: Boolean) { bioAutoPrompt = v; sp.edit().putBoolean("bio_auto", v).apply() }
-    fun setSecure(v: Boolean) { blockScreenshots = v; sp.edit().putBoolean("secure", v).apply() }
-    fun updateTapToReveal(v: Boolean) { tapToReveal = v; sp.edit().putBoolean("reveal", v).apply() }
+    inner class IntPref(private val key: String, def: Int) {
+        var value by mutableIntStateOf(sp.getInt(key, def)); private set
+        fun set(v: Int) { value = v; sp.edit().putInt(key, v).apply() }
+    }
+
+    inner class LongPref(private val key: String, def: Long) {
+        var value by mutableLongStateOf(sp.getLong(key, def)); private set
+        fun set(v: Long) { value = v; sp.edit().putLong(key, v).apply() }
+    }
+
+    // Apparence
+    val theme = IntPref("theme", 0)                 // 0 système, 1 clair, 2 sombre
+    val amoled = BoolPref("amoled", false)          // fond noir pur en mode sombre
+    val dynamicColor = BoolPref("dynamic", false)   // couleurs Material You (Android 12+)
+    val compact = BoolPref("compact", false)        // liste compacte
+    val showIcons = BoolPref("icons", true)
+    val codeSize = IntPref("code_size", 1)          // 0 petit, 1 normal, 2 grand
+
+    // Codes
+    val tapToReveal = BoolPref("reveal", false)
+    val groupDigits = BoolPref("group_digits", true)
+    val showNextCode = BoolPref("next_code", false)
+    val sortMode = IntPref("sort", 0)               // 0 émetteur, 1 compte, 2 plus récents
+    val clipboardClear = IntPref("clip_clear", 45)  // secondes, 0 = jamais
+    val minimizeOnCopy = BoolPref("minimize_copy", false)
+    val haptics = BoolPref("haptics", true)
+
+    // Sécurité
+    val autoLockSeconds = IntPref("autolock", 30)   // -1 = jamais
+    val bioAutoPrompt = BoolPref("bio_auto", true)
+    val blockScreenshots = BoolPref("secure", true)
+    val passwordReminderDays = IntPref("pw_reminder", 14) // 0 = jamais
+    val lastPasswordUnlock = LongPref("pw_last", 0L)
+
+    // Synchronisation
+    val syncInterval = IntPref("sync_interval", 60) // secondes
+    val syncWifiOnly = BoolPref("sync_wifi", false)
 }
 
 class KerbosApp : Application() {
@@ -46,13 +74,19 @@ class KerbosApp : Application() {
     val pendingUri = MutableStateFlow<String?>(null)
 
     private var stoppedAt = 0L
+    /** Set before opening a system picker so leaving the app briefly does not lock the vault. */
+    private var externalUntil = 0L
+
+    fun expectExternalActivity() {
+        externalUntil = System.currentTimeMillis() + 5 * 60_000
+    }
 
     override fun onCreate() {
         super.onCreate()
         instance = this
         prefs = Prefs(this)
         vault = VaultRepository(this)
-        sync = SyncManager(vault)
+        sync = SyncManager(this, vault, prefs)
         IconLibrary.init(this)
 
         ProcessLifecycleOwner.get().lifecycle.addObserver(object : DefaultLifecycleObserver {
@@ -61,9 +95,12 @@ class KerbosApp : Application() {
             }
 
             override fun onStart(owner: LifecycleOwner) {
-                val t = prefs.autoLockSeconds
-                if (stoppedAt > 0 && t >= 0 && vault.state.value == VaultState.UNLOCKED &&
-                    System.currentTimeMillis() - stoppedAt >= t * 1000L
+                val now = System.currentTimeMillis()
+                val external = now < externalUntil
+                externalUntil = 0
+                val t = prefs.autoLockSeconds.value
+                if (!external && stoppedAt > 0 && t >= 0 && vault.state.value == VaultState.UNLOCKED &&
+                    now - stoppedAt >= t * 1000L
                 ) vault.lock()
                 else if (vault.state.value == VaultState.UNLOCKED) sync.requestSync()
             }

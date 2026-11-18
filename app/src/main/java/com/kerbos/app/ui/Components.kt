@@ -105,8 +105,10 @@ fun copyToClipboard(ctx: Context, label: String, text: String) {
     }
     cm.setPrimaryClip(clip)
     if (Build.VERSION.SDK_INT < 33) Toast.makeText(ctx, "Code copié", Toast.LENGTH_SHORT).show()
+    val clearAfter = com.kerbos.app.app.prefs.clipboardClear.value
+    if (clearAfter <= 0) return
     clipScope.launch {
-        delay(45_000)
+        delay(clearAfter * 1000L)
         runCatching {
             val cur = cm.primaryClip
             if (cur != null && cur.itemCount > 0 && cur.getItemAt(0).text?.toString() == text) {

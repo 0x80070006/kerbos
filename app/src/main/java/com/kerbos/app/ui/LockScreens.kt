@@ -37,7 +37,11 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
+import android.app.Activity
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.ui.platform.LocalView
+import androidx.core.view.WindowCompat
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -66,6 +70,16 @@ import kotlinx.coroutines.launch
 
 @Composable
 private fun BrandBackground(content: @Composable () -> Unit) {
+    // Light status/navigation bar icons on the dark brand gradient.
+    val view = LocalView.current
+    DisposableEffect(Unit) {
+        val c = WindowCompat.getInsetsController((view.context as Activity).window, view)
+        val prevS = c.isAppearanceLightStatusBars
+        val prevN = c.isAppearanceLightNavigationBars
+        c.isAppearanceLightStatusBars = false
+        c.isAppearanceLightNavigationBars = false
+        onDispose { c.isAppearanceLightStatusBars = prevS; c.isAppearanceLightNavigationBars = prevN }
+    }
     Box(
         Modifier.fillMaxSize().background(BrandGradient).systemBarsPadding().imePadding(),
         contentAlignment = Alignment.Center,
@@ -106,7 +120,14 @@ fun LockScreen(activity: FragmentActivity) {
     var pw by remember { mutableStateOf("") }
     var error by remember { mutableStateOf<String?>(null) }
     var busy by remember { mutableStateOf(false) }
-    val bioAvailable = remember { vault.hasBiometricSlot() && Biometric.available(activity) }
+    val prefs = app.prefs
+    // Periodic password reminder (like Aegis): biometrics are not offered when it is due.
+    val pwDue = remember {
+        val d = prefs.passwordReminderDays.value
+        d > 0 && prefs.lastPasswordUnlock.value > 0 &&
+            System.currentTimeMillis() - prefs.lastPasswordUnlock.value > d * 86_400_000L
+    }
+    val bioAvailable = remember { !pwDue && vault.hasBiometricSlot() && Biometric.available(activity) }
 
     fun startBio() {
         val cipher = vault.biometricCipher()
@@ -135,14 +156,14 @@ fun LockScreen(activity: FragmentActivity) {
             busy = true; error = null
             val ok = vault.unlockWithPassword(pw.toCharArray())
             busy = false
-            if (!ok) error = "Mot de passe incorrect" else pw = ""
+            if (!ok) error = "Mot de passe incorrect" else { pw = ""; prefs.lastPasswordUnlock.set(System.currentTimeMillis()) }
         }
     }
 
     // Biometrics as default unlock: prompt automatically as soon as the screen is visible.
     val lifecycleOwner = LocalLifecycleOwner.current
     LaunchedEffect(Unit) {
-        if (bioAvailable && app.prefs.bioAutoPrompt) {
+        if (bioAvailable && prefs.bioAutoPrompt.value) {
             lifecycleOwner.lifecycle.withResumed { }
             delay(200)
             startBio()
@@ -159,6 +180,16 @@ fun LockScreen(activity: FragmentActivity) {
             Text("Kerbos", style = MaterialTheme.typography.headlineLarge, color = Color.White)
             Text("Votre coffre est verrouillé", color = Color.White.copy(alpha = 0.8f))
             Spacer(Modifier.height(36.dp))
+
+            if (pwDue) {
+                Surface(color = Color.White.copy(alpha = 0.14f), shape = RoundedCornerShape(14.dp)) {
+                    Text(
+                        "Rappel : saisissez votre mot de passe pour ne pas l'oublier.",
+                        color = Color.White, modifier = Modifier.padding(12.dp), textAlign = TextAlign.Center,
+                    )
+                }
+                Spacer(Modifier.height(20.dp))
+            }
 
             if (bioAvailable) {
                 Surface(
@@ -219,13 +250,14 @@ fun SetupScreen(activity: FragmentActivity) {
         busy = true; error = null
         scope.launch {
             vault.create(pw.toCharArray())
+            app.prefs.lastPasswordUnlock.set(System.currentTimeMillis())
             if (useBio) {
                 try {
                     Biometric.prompt(
                         activity, BiometricKey.encryptCipher(),
                         title = "Activer la biométrie", subtitle = "Kerbos se déverrouillera avec votre empreinte",
                         negative = "Plus tard",
-                        onSuccess = { c -> vault.enableBiometric(c); app.prefs.setBioAuto(true); vault.finishSetup() },
+                        onSuccess = { c -> vault.enableBiometric(c); app.prefs.bioAutoPrompt.set(true); vault.finishSetup() },
                         onError = { _, _ -> vault.finishSetup() },
                     )
                 } catch (e: Exception) {

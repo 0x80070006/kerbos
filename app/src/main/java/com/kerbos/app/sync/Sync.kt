@@ -134,14 +134,33 @@ class WebDav(private val cfg: SyncConfig) {
 
     class Remote(val body: String, val etag: String?)
 
+    /**
+     * Downloads the vault. Compression is disabled on purpose: proxies (nginx/Apache) that gzip
+     * the response turn the ETag into a weak one (W/"…") which never satisfies If-Match.
+     * Nextcloud's own OC-ETag header is preferred when present.
+     */
     fun get(): Remote? {
         val url = fileUrl()
-        client.newCall(req(url).get().build()).execute().use { r ->
+        client.newCall(req(url).get().header("Accept-Encoding", "identity").build()).execute().use { r ->
             return when (r.code) {
-                200 -> Remote(r.body?.string() ?: "", r.header("ETag"))
+                200 -> Remote(r.body?.string() ?: "", cleanEtag(r.header("OC-ETag") ?: r.header("ETag")))
                 404 -> null
                 else -> throw httpError(r.code, url)
             }
+        }
+    }
+
+    /** ETag as reported by WebDAV (getetag), unaffected by response compression. */
+    fun davEtag(): String? {
+        val url = fileUrl()
+        val body = """<?xml version="1.0"?><d:propfind xmlns:d="DAV:"><d:prop><d:getetag/></d:prop></d:propfind>"""
+        client.newCall(
+            req(url).header("Depth", "0").method("PROPFIND", body.toRequestBody("application/xml".toMediaType())).build()
+        ).execute().use { r ->
+            if (r.code != 207) return null
+            val xml = r.body?.string() ?: return null
+            return Regex("<[^>]*getetag[^>]*>([^<]+)<").find(xml)?.groupValues?.get(1)
+                ?.replace("&quot;", "\"")?.let(::cleanEtag)
         }
     }
 
@@ -175,11 +194,16 @@ class WebDav(private val cfg: SyncConfig) {
         }
     }
 
-    /** Returns false when the remote file changed since [etag] (HTTP 412). */
-    fun put(body: String, etag: String?): Boolean {
+    /**
+     * Returns false when the precondition failed (HTTP 412).
+     * [etag] null → only create (If-None-Match: *); [unconditional] → plain overwrite.
+     */
+    fun put(body: String, etag: String?, unconditional: Boolean = false): Boolean {
         val url = fileUrl()
         val b = req(url).put(body.toRequestBody("application/json".toMediaType()))
-        if (etag != null) b.header("If-Match", etag) else b.header("If-None-Match", "*")
+        if (!unconditional) {
+            if (etag != null) b.header("If-Match", etag) else b.header("If-None-Match", "*")
+        }
         client.newCall(b.build()).execute().use { r ->
             return when (r.code) {
                 200, 201, 204 -> true
@@ -214,6 +238,14 @@ class WebDav(private val cfg: SyncConfig) {
 
     companion object {
         const val FILE_NAME = "kerbos-vault.json"
+
+        /** Strong, quoted form of an ETag: strips the weak prefix and any compression suffix (-gzip, ;gzip). */
+        fun cleanEtag(raw: String?): String? {
+            var e = raw?.trim()?.removePrefix("W/")?.removePrefix("w/")?.trim() ?: return null
+            if (e.isEmpty()) return null
+            e = e.trim('"').replace(Regex("[-;](gzip|br|deflate)$"), "")
+            return "\"$e\""
+        }
         private val idCache = ConcurrentHashMap<String, String>()
         val client: OkHttpClient = OkHttpClient.Builder()
             .connectTimeout(20, TimeUnit.SECONDS).readTimeout(30, TimeUnit.SECONDS)
@@ -241,6 +273,7 @@ class SyncManager(private val ctx: Context, private val vault: VaultRepository, 
     private val mutex = Mutex()
     private var loop: Job? = null
     private var keyCache: Triple<String, String, ByteArray>? = null // passphrase, salt, key
+    @Volatile private var etagUnreliable = false
 
     private val _status = MutableStateFlow<SyncStatus>(SyncStatus.Idle)
     val status: StateFlow<SyncStatus> = _status.asStateFlow()
@@ -274,6 +307,7 @@ class SyncManager(private val ctx: Context, private val vault: VaultRepository, 
 
     fun onConfigChanged() {
         keyCache = null
+        etagUnreliable = false
         requestSync()
     }
 
@@ -323,9 +357,21 @@ class SyncManager(private val ctx: Context, private val vault: VaultRepository, 
         result
     }
 
+    /**
+     * One sync cycle: download → merge (local ∪ remote, newest wins, duplicates collapsed) → upload.
+     *
+     * Upload is adaptive:
+     *  1. If-Match with the ETag from the download (normal, race-free path);
+     *  2. on 412, retry with the ETag read through PROPFIND (servers/proxies that rewrite ETags);
+     *  3. if the server still refuses preconditions, re-download, re-merge and overwrite without
+     *     precondition, then the next pass re-reads the file to verify nothing was lost (any entry
+     *     written by another device in between is merged back and uploaded again).
+     */
     private fun runCycle(cfg: SyncConfig): SyncStatus {
         val dav = WebDav(cfg)
-        repeat(6) {
+        // Servers whose ETags never satisfy If-Match go straight to write-then-verify.
+        var refused = if (etagUnreliable) 3 else 0
+        repeat(10) { attempt ->
             val remote = dav.get()
             val salt: ByteArray
             val iter: Int
@@ -357,11 +403,26 @@ class SyncManager(private val ctx: Context, private val vault: VaultRepository, 
                 val body = JSONObject().put("format", FORMAT).put("version", 1).put("kdf", "pbkdf2-sha256")
                     .put("iter", iter).put("salt", Crypto.b64(salt))
                     .put("nonce", Crypto.b64(s.nonce)).put("data", Crypto.b64(s.ct)).toString()
-                if (!dav.put(body, remote?.etag)) return@repeat // someone else wrote meanwhile → retry
+                val ok = when {
+                    remote == null -> dav.put(body, null)
+                    refused >= 3 -> dav.put(body, null, unconditional = true)
+                    refused >= 1 -> dav.put(body, dav.davEtag() ?: remote.etag)
+                    else -> dav.put(body, remote.etag)
+                }
+                if (!ok) {
+                    refused++
+                    if (refused >= 3) etagUnreliable = true
+                    Thread.sleep(250L * (attempt + 1))
+                    return@repeat // someone else wrote meanwhile, or the server rejects the ETag → retry
+                }
+                if (refused >= 3) {
+                    refused = 0 // forced write done: next pass re-reads to verify
+                    return@repeat
+                }
             }
             return SyncStatus.Ok(System.currentTimeMillis(), merged.count { !it.deleted })
         }
-        throw SyncException("Conflit d'écriture persistant, nouvel essai plus tard.")
+        throw SyncException("Le serveur refuse l'écriture du coffre après plusieurs essais, nouvel essai plus tard.")
     }
 
     suspend fun test(cfg: SyncConfig): String = withContext(Dispatchers.IO) {

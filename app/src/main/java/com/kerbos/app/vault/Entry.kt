@@ -92,7 +92,45 @@ object Merge {
         val map = LinkedHashMap<String, Entry>()
         for (e in local) map[e.uuid] = map[e.uuid]?.let { winner(it, e) } ?: e
         for (e in remote) map[e.uuid] = map[e.uuid]?.let { winner(it, e) } ?: e
-        return map.values.filter { !(it.deleted && now - it.updatedAt > TOMBSTONE_TTL) }
+        return collapseDuplicates(map.values.toList())
+            .filter { !(it.deleted && now - it.updatedAt > TOMBSTONE_TTL) }
+    }
+
+    /** Same OTP account = same secret and same generation parameters. */
+    private fun accountKey(e: Entry) =
+        "${com.kerbos.app.otp.Base32.normalize(e.secret)}|${e.type}|${e.algo}|${e.digits}|${e.period}"
+
+    /**
+     * Collapses the same account stored under several uuids (e.g. added or imported on two
+     * devices before they synced). Deterministic, so every device reaches the same result:
+     * the smallest uuid is kept, it takes the content of the most recently edited copy (empty
+     * fields completed by the others), and the other copies become tombstones that propagate.
+     */
+    fun collapseDuplicates(list: List<Entry>): List<Entry> {
+        val groups = list.filter { !it.deleted && it.secret.isNotBlank() }
+            .groupBy(::accountKey).values.filter { it.size > 1 }
+        if (groups.isEmpty()) return list
+        val replace = HashMap<String, Entry>()
+        for (g0 in groups) {
+            val g = g0.sortedBy { it.uuid }
+            val keep = g.first()
+            val latest = g.maxWith(compareBy<Entry> { it.updatedAt }.thenBy { it.toJson().toString() })
+            // +1: the merged copy must win over every original copy on devices that have not collapsed yet.
+            val ts = latest.updatedAt + 1
+            replace[keep.uuid] = latest.copy(
+                uuid = keep.uuid,
+                issuer = latest.issuer.ifBlank { g.firstOrNull { it.issuer.isNotBlank() }?.issuer ?: "" },
+                name = latest.name.ifBlank { g.firstOrNull { it.name.isNotBlank() }?.name ?: "" },
+                icon = latest.icon ?: g.firstNotNullOfOrNull { it.icon },
+                group = latest.group.ifBlank { g.firstOrNull { it.group.isNotBlank() }?.group ?: "" },
+                note = latest.note.ifBlank { g.firstOrNull { it.note.isNotBlank() }?.note ?: "" },
+                counter = if (latest.type == com.kerbos.app.otp.OtpType.HOTP) g.maxOf { it.counter } else latest.counter,
+                createdAt = g.minOf { it.createdAt },
+                updatedAt = ts,
+            )
+            for (o in g.drop(1)) replace[o.uuid] = o.tombstone(ts)
+        }
+        return list.map { replace[it.uuid] ?: it }
     }
 
     fun same(a: List<Entry>, b: List<Entry>): Boolean = a.associateBy { it.uuid } == b.associateBy { it.uuid }

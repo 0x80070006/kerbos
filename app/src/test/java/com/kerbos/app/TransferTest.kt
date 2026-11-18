@@ -133,6 +133,32 @@ class TransferTest {
         assertEquals(Base32.encode("Hello!".toByteArray()), r.entries.single().secret)
     }
 
+    @Test fun sameAccountOnTwoDevicesIsCollapsedIdentically() {
+        // Device A and device B each added GitHub (same secret) before syncing; B also has Proton.
+        val ghA = Entry(uuid = "aaaa", issuer = "GitHub", name = "dev", secret = "JBSWY3DPEHPK3PXP", createdAt = 100, updatedAt = 100, icon = "si:github")
+        val ghB = Entry(uuid = "bbbb", issuer = "GitHub", name = "dev", secret = "jbsw y3dp ehpk 3pxp", createdAt = 200, updatedAt = 200, group = "Pro")
+        val proton = Entry(uuid = "cccc", issuer = "Proton", secret = "KRSXG5CTMVRXEZLU", updatedAt = 150)
+        val onA = Merge.merge(listOf(ghA), listOf(ghB, proton), now = 1000)
+        val onB = Merge.merge(listOf(ghB, proton), listOf(ghA), now = 1000)
+        assertEquals(onA.toSet(), onB.toSet())
+        val live = onA.filter { !it.deleted }
+        assertEquals(2, live.size)
+        val gh = live.single { it.issuer == "GitHub" }
+        assertEquals("aaaa", gh.uuid)          // smallest uuid kept
+        assertEquals("Pro", gh.group)          // latest copy's data
+        assertEquals("si:github", gh.icon)     // completed from the other copy
+        assertTrue(onA.single { it.uuid == "bbbb" }.deleted)
+        // Idempotent: merging again changes nothing, and an old copy cannot come back.
+        assertTrue(Merge.same(onA, Merge.merge(onA, listOf(ghA, ghB), now = 1000)))
+    }
+
+    @Test fun etagNormalisation() {
+        assertEquals("\"abc\"", com.kerbos.app.sync.WebDav.cleanEtag("W/\"abc\""))
+        assertEquals("\"abc\"", com.kerbos.app.sync.WebDav.cleanEtag("\"abc-gzip\""))
+        assertEquals("\"abc\"", com.kerbos.app.sync.WebDav.cleanEtag("abc"))
+        assertEquals(null, com.kerbos.app.sync.WebDav.cleanEtag(null))
+    }
+
     @Test fun mergeKeepsBothSidesAndDeletions() {
         val a = Entry(issuer = "A", secret = "JBSWY3DPEHPK3PXP", updatedAt = 10)
         val b = Entry(issuer = "B", secret = "JBSWY3DPEHPK3PXP", updatedAt = 11)
